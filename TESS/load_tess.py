@@ -1,20 +1,19 @@
 ### Imports and Constants ###
 # Imports
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
 import lightkurve as lk
 from astropy.io import fits
 from typing import NamedTuple
+from constants import *
 
 # Constants
 from astropy.constants import R_earth, R_sun
 R_Sun_over_R_Earth = float( R_sun / R_earth )
 url = 'https://mast.stsci.edu/api/v0.1/Download/file?uri='
-dt_tess = 0.001388882
 
 # Transit
-import TESS.transit_tess as transit_tess
+from planet import transit
 
 
 ### Loading Star Data ###
@@ -68,9 +67,9 @@ def StarInfo_init_tess(tessid, name = 'star_info_withplanets'):
 
     radius = data_star['iso_rad'].item()
     radius_err = np.maximum(data_star['iso_rad_err1'].item(),
-                           -data_star['iso_age_err2'].item()) / radius
+                           -data_star['iso_rad_err2'].item()) / radius
     radius_err_high = data_star['iso_rad_err1'].item() / radius
-    radius_err_low = data_star['iso_age_err2'].item() / radius
+    radius_err_low = data_star['iso_rad_err2'].item() / radius
 
     logg = data_star['iso_logg'].item()
     feh = data_star['iso_feh'].item()
@@ -98,7 +97,7 @@ def StarInfo_init_tess(tessid, name = 'star_info_withplanets'):
 
 
 ### Loading Fluxes ###
-def read_tess_light_curve(tessid, PDCSAP = True, invert=False):
+def read_tess_light_curve(tessid, n_bins = 1, PDCSAP = True, invert=False):
   """Reads time and flux measurements for a TESS target star.
   Args:
     filenames: A list of .fits files containing time and flux measurements.
@@ -112,7 +111,9 @@ def read_tess_light_curve(tessid, PDCSAP = True, invert=False):
   all_flux = []
   all_flags = []
 
-  search_result = lk.search_lightcurve('TIC ' + str(tessid), mission="TESS", author=["SPOC"])
+  search_result = lk.search_lightcurve('TIC ' + str(tessid), mission="TESS", 
+                                       author=["SPOC"], exptime=120)
+
 
   for res in search_result :
     uri = res.table.as_array()['dataURI'].data[0]
@@ -132,13 +133,30 @@ def read_tess_light_curve(tessid, PDCSAP = True, invert=False):
     flux = flux[valid_indices]
     flags = flags[valid_indices]
 
+    # # Don't use short Cadence
+    # if time[1] - time[0] < 0.001 :
+    #     continue
+
+    if n_bins != 1 : 
+        # Average over bins of size n_bins to decrease computational cost
+        n = len(time); diff = n % n_bins
+        mask = np.concatenate([np.ones(n - diff, dtype=bool), np.zeros(diff, dtype=bool)])
+
+        time = time[mask].reshape(-1, n_bins).mean(axis=1)
+        flux = flux[mask].reshape(-1, n_bins).mean(axis=1)
+        flags = flags[mask].reshape(-1, n_bins).mean(axis=1)
+
     if invert:
       flux *= -1
 
-    if time.size:
+    if time.size :
+
       all_time.append(time)
       all_flux.append(flux)
       all_flags.append(flags)
+
+    # Use only first batch    
+    # break
 
   return all_time, all_flux, all_flags
 
@@ -160,6 +178,19 @@ def read_lc_tess(tessid, injected = False):
     
     return Time, Flux, Flags, quarter_beginnings
 
+def read_alternative(tessid, bins, injected = False):
+    """reads the downloaded lightcurbes.
+    retrurns concatenated time, flux from all quarters, TESS flags (kind of useless) and a list of quarter borders in days"""
+    
+    all_time, all_flux, all_flags = read_tess_light_curve(tessid, bins)
+    for i in range(len(all_time)):
+        all_flux[i] = (all_flux[i] / np.average(all_flux[i])) - 1
+    
+    # [time(quarter begining) for each quarter]
+    quarter_beginnings = np.array([0.5*(all_time[i-1][-1] + all_time[i][0]) - all_time[0][0] for i in range(1, len(all_time))]) 
+    
+    return all_time, all_flux, all_flags, quarter_beginnings
+
 
 
 ### Adding Zeros ###
@@ -173,7 +204,7 @@ def add_zeros_tess(time, Flux, hyperparametrs, export_path = None, zero_paddling
 
     #normalizes times and finds where there is missing data
     difference_Time = (time[1:] - time[:-1])
-    difference_Time /= dt_tess  # dimensionless t[i+1]-t[i]
+    difference_Time /= dt  # dimensionless t[i+1]-t[i]
     difference_Time = np.round(difference_Time, 0).astype(int)
     mask = difference_Time > 1
     indexes = (np.arange(len(difference_Time), dtype = int)+1)[mask]
@@ -193,7 +224,7 @@ def add_zeros_tess(time, Flux, hyperparametrs, export_path = None, zero_paddling
     indexes_all_repeated = indexes_all_repeated + [len(Flux), ] * num_zero_padding
     Flux = np.insert(Flux, indexes_all_repeated, np.zeros(len(indexes_all_repeated)))
     invVar = np.insert(invVar, indexes_all_repeated, np.zeros(len(indexes_all_repeated)))
-    Time = time[0] + dt_tess * np.arange(len(Flux))
+    Time = time[0] + dt * np.arange(len(Flux))
 
     #prints in a file
     if export_path != None:
@@ -222,7 +253,7 @@ def read_known_planets_tess(star, t_start, test_recovery = True):
     
     dfp = dfp[dfp['TIC ID'] == star.kepid]
     
-    dfp = dfp[dfp['TFOPWG Disposition'].isin(['PC', 'CP'])]
+    dfp = dfp[dfp['TFOPWG Disposition'].isin(['PC', 'CP', 'KP'])]
     
     ## TO DO: Find such a data set for TESS
     # # do not include the candidates that are being tested
@@ -245,11 +276,11 @@ def read_known_planets_tess(star, t_start, test_recovery = True):
     perm = np.argsort(-planet_props[:, -1]) # sort by decreasing SNR
     planet_props = planet_props[perm, :]
 
-    splines = [transit_tess.prepare_shape(rr, star.u1, star.u1) for rr in planet_props[:, 3]]
+    splines = [transit.prepare_shape(rr, star.u1, star.u2) for rr in planet_props[:, 3]]
 
-    return [transit_tess.Info(planet_props[i, -1], planet_props[i, :3], splines[i], True) for i in range(len(planet_props))]
+    return [transit.Info(planet_props[i, -1], planet_props[i, :3], splines[i], True) for i in range(len(planet_props))]
 
 
 ### q TESS ###
 def q_in_dt_units_tess(q):
-    return q * np.power(dt_tess, -2./3.)
+    return q * np.power(dt, -2./3.)
