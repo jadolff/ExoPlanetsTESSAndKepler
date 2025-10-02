@@ -1,30 +1,11 @@
-from constants import *
-from load.lc import read_lc, add_zeros, quarter_indexes
-from load.planet import read as read_known_planets
-from load.star import StarInfo_init
-
-from gaussianization import gaussianize
-from fourier.MF import stationary
-from planet import transit, tauprior, nst, inject
-from false_alarms.pipeline import fa_search
-from false_alarms import spurious_transits
-
-from pipeline import nonstationary, ttv, joint, scratch_structure
-from pipeline import vetting
-from pipeline.inv_scr import get_data_transform
-from detection.cpu.pipeline import run as detect
-from detection.cpu.pipeline import prepare as prepare_for_detection
-from detection.cpu.scan import q_in_dt_units
-from detection.cpu import template
-
-# New Imports
-from TESS.load_tess import StarInfo_init_tess, read_lc_tess, add_zeros_tess, read_known_planets_tess, dt_tess, q_in_dt_units_tess
-import TESS.transit_tess as transit_tess
-
+# Some numpy fix
+import numpy as np
+if not hasattr(np, "int"):
+    np.int = int
+import time
 
 def bit_info(numbers, bit):
     return np.floor_divide(numbers - np.floor_divide(numbers, 2**(bit))* (2**bit), 2**(bit-1))
-
 
 
 def plot_residuals(Time, Flux, FGP, plotdir):
@@ -70,20 +51,17 @@ def LOAD_KEP(kepid, folder, hyperparams, batch_num) :
     star = StarInfo_init(kepid, 'star_info_gaia')#'star_info_withplanets')
     
     time, flux, flags, quarter_beginnings = read_lc(star.kepid, injected = False)
-    
     average, flux_sigma = gaussianize.rescale(flux) #flux_sigma: we rescale the flux to unit variance of the Gaussian part of the noise distribution flux_sigma * our_flux = original_flux (which is measured in units of star's flux)
     star = star._replace(sigma_star_flux_units = flux_sigma)
     flux = (flux - average) / flux_sigma
     t_start = time[0]
     time -= t_start
-    
+        
     Time, Flux, invVar = add_zeros(time, flux, hyperparams)
+    planet_props = read_known_planets(star, t_start, hyperparams.test_recovery)    
+    quarters = quarter_indexes(Time, quarter_beginnings)
     max_num_periods = (int)(2 * (Time[-1] / hyperparams.period_min)) # factor of two just to be sure
 
-    quarters = quarter_indexes(Time, quarter_beginnings)
-
-    planet_props = read_known_planets(star, t_start, hyperparams.test_recovery)
-    
     spline = transit.prepare_shape(0, star.u1, star.u1) #spline for the planet transit shape (will be used for the search, assuming small planets)
     spline_prior = tauprior.load(star.err_q) # spline for the shape of the transit duration prior
 
@@ -96,7 +74,7 @@ def LOAD_KEP(kepid, folder, hyperparams, batch_num) :
 
     return star, t_start, Time, Flux, invVar, max_num_periods, quarters, planet_props, spline, spline_prior
 
-def LOAD_TESS(tessid, folder, hyperparams, batch_num) :
+def LOAD_TESS(tessid, folder, hyperparams, batch_num, n_bins) :
 
     # Saving Pictures
     tessid_folder_name = str(tessid) + ('_' + str(batch_num) if (batch_num != 0) else '')
@@ -106,9 +84,13 @@ def LOAD_TESS(tessid, folder, hyperparams, batch_num) :
 
     # Loading Data
     star = StarInfo_init_tess(tessid, 'star_info_gaia')#'star_info_withplanets')
-    
-    time, flux, flags, quarter_beginnings = read_lc_tess(star.kepid, injected = False)
-    
+
+    # We read in each section Seperately
+    all_time, all_flux, all_flags, quarter_beginnings = read_alternative(tessid, n_bins, injected = False)
+    num_transits = len(all_time)
+
+    # Do Total case
+    time, flux, flags = np.concatenate(all_time), np.concatenate(all_flux), np.concatenate(all_flags)
     average, flux_sigma = gaussianize.rescale(flux) #flux_sigma: we rescale the flux to unit variance of the Gaussian part of the noise distribution flux_sigma * our_flux = original_flux (which is measured in units of star's flux)
     star = star._replace(sigma_star_flux_units = flux_sigma)
     flux = (flux - average) / flux_sigma
@@ -121,8 +103,27 @@ def LOAD_TESS(tessid, folder, hyperparams, batch_num) :
     quarters = quarter_indexes(Time, quarter_beginnings)
 
     planet_props = read_known_planets_tess(star, t_start, hyperparams.test_recovery)
-    
-    spline = transit_tess.prepare_shape(0, star.u1, star.u1) #spline for the planet transit shape (will be used for the search, assuming small planets)
+
+
+    # Split Up Into individual Transits for Easier Search Later
+    Times, Fluxes, invVars, planet_propes, index_start = [], [], [], [], []
+    for i in range(num_transits) :
+        average, flux_sigma = gaussianize.rescale(all_flux[i]) 
+        all_flux[i] = (all_flux[i] - average) / flux_sigma
+        t_start_i = all_time[i][0]
+        all_time[i] -= t_start_i
+        
+        Time_i, Flux_i, invVar_i = add_zeros_tess(all_time[i], all_flux[i], hyperparams)
+        planet_props_i = read_known_planets_tess(star, t_start_i, hyperparams.test_recovery)
+
+        Times.append(Time_i); Fluxes.append(Flux_i); invVars.append(invVar_i)
+        planet_propes.append(planet_props_i)
+
+        index_start.append( np.where( abs(Time + t_start - t_start_i) < 0.001 )[0][0] )
+    seperate_transists = [Times, Fluxes, invVars, planet_propes, index_start]
+        
+    # Spline
+    spline = transit.prepare_shape(0, star.u1, star.u2) #spline for the planet transit shape (will be used for the search, assuming small planets)
     spline_prior = tauprior.load(star.err_q) # spline for the shape of the transit duration prior
 
     if hyperparams.show:
@@ -132,16 +133,18 @@ def LOAD_TESS(tessid, folder, hyperparams, batch_num) :
         plt.savefig(plotdir + 'flux_normalized.png')
         plt.close()
 
-    return star, t_start, Time, Flux, invVar, max_num_periods, quarters, planet_props, spline, spline_prior
+    return star, t_start, Time, Flux, invVar, max_num_periods, quarters, planet_props, spline, spline_prior, seperate_transists
 
 
 def mainn(kepid, folder, hyperparams, 
           nst_seed= None, inj_seed = None,
-          inj_params= None, batch_num = 0, TESS = False):
+          inj_params= None, batch_num = 0, start_time = 0.0, bins = 1):
 
+    # What is the relvant survey
+    survey = hyperparams.survey
+    TESS = (survey == "TESS")
 
-    #kepid, batch = job_map(id_job)
-    #batch_props = hyperparams.batch_props.iloc[batch]
+    ## TO DO: Add survey specific folder structure 
     kepid_folder_name = str(kepid) + ('_' + str(batch_num) if (batch_num != 0) else '')
     plotdir = (scratch + folder + '/plots/' + kepid_folder_name + '/') if hyperparams.show else None
     if hyperparams.show:
@@ -149,20 +152,151 @@ def mainn(kepid, folder, hyperparams,
     
     ### load data ###
     if TESS :
-        star, t_start, Time, Flux, invVar, max_num_periods, quarters, planet_props, spline, spline_prior = LOAD_TESS(kepid, folder, hyperparams, batch_num)
-        dt = dt_tess
+        star, t_start, Time, Flux, invVar, max_num_periods, quarters, planet_props, spline, spline_prior, seperate_transists = LOAD_TESS(kepid, folder, hyperparams, batch_num, bins)
     else : 
         star, t_start, Time, Flux, invVar, max_num_periods, quarters, planet_props, spline, spline_prior = LOAD_KEP(kepid, folder, hyperparams, batch_num)
 
+    print(f"Size of Input Flux Array is {len(Flux)}")
+
+    time_now = time.time()
+    print(f"Reading data and preprocessing took {int(time_now - start_time)} seconds.")
+
     ### jointly fit FGP, planets and gaussianize outliers ###
-    planet_props, Flux, model, Pk, FGP, bandwidth, _, sharp_freq = joint.iteration(Time, Flux, invVar, planet_props, sharp_freq= None)
+    # For TESS, fit each quarter seperately
+    if TESS : 
+
+        model = np.zeros_like(Flux); FGP = np.zeros_like(Flux)
+        for i in range( len(seperate_transists[0]) ) :
+            Time_i = seperate_transists[0][i]
+            Flux_i = seperate_transists[1][i]
+            invVar_i = seperate_transists[2][i]
+            planet_props_i = seperate_transists[3][i]
+            index_start = seperate_transists[4][i]
+
+            planet_props_i, Fluxi, modeli, Pk, FGPi, bandwidth, _, _ = joint.iteration(Time_i, Flux_i, invVar_i, planet_props_i, sharp_freq= None)
+
+            # Change Model, GP and Flux
+            N = len(Fluxi)
+
+            # Take Care of edge case
+            n = np.min([index_start + N, len(Flux)])
+            if n == len(Flux) :
+                k = len(Flux) - index_start
+            else :
+                k = N
+
+            Flux[ index_start : n] = Fluxi[:k]
+            model[index_start : n] = modeli[:k] 
+            FGP[  index_start : n] = FGPi[:k]
+
+        # Get Pk and Bandwidth
+        from fourier import GP, notch
+        mask_planets = ttv.mask_planets(Time, planet_props)
+        invVar_noplanets = np.copy(invVar)
+        invVar_noplanets[mask_planets] = 0
+
+        mask = invVar_noplanets < 0.5
+        flux_for_FGP = np.copy(Flux)
+        flux_for_FGP[mask] = FGP[mask]
+        PSD = np.square(np.abs(np.fft.rfft(flux_for_FGP)))
+        bandwidth = GP.automatic_bandwidth(PSD)
+        Pk = GP.getPSD(flux_for_FGP, bandwidth)
+
+        # Get peaks
+        N = len(Flux)
+        freq = np.arange(len(PSD)) / (N * dt)
+        PSD_for_peaks = PSD[freq < 20] # Do a frequency cutoff for speed
+        peaks = notch.sharp_peaks(PSD_for_peaks)
+        has_peaks = (len(peaks) != 0)
+        if has_peaks:
+            sharp_freq = peaks/Time[-1]
+        else:
+            sharp_freq = np.array([])
+
+        # Notch Filter
+        Pk *= notch.filter(len(Flux), sharp_freq)
+
+    else :
+        planet_props, Flux, model, Pk, FGP, bandwidth, mask_planets, sharp_freq = joint.iteration(Time, Flux, invVar, planet_props, sharp_freq= None)
+
+    time_now2 = time.time()
+    print(f"Initial Fit took {int(time_now2 - time_now)} seconds.")
+
+    ### Some Plots ###
+    # Gaussian Process
+    mask = Time < 5
+
+    plt.figure(figsize=(16,8), dpi=550)
+    plt.plot(Time[mask], Flux[mask], label="Observed Flux", alpha=0.33)
+    plt.plot(Time[mask], FGP[mask], label="GP of Stellar Variability", color="red")
+    plt.plot(Time[mask], model[mask], label="Fit of Planet Transit", alpha=0.5)
+    plt.xlabel("t [days]"); plt.legend()
+    plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/flux_plot_zoom.png')
+    plt.close()
+
+    plt.figure(figsize=(16,8), dpi=550)
+    plt.plot(Time, Flux, label="Observed Flux")
+    plt.plot(Time, FGP, label="GP of Stellar Variability")
+    plt.plot(Time, model, label="Fit of Planet Transit")
+    plt.xlabel("t [days]"); plt.legend()
+    plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/flux_plot.png')
+    plt.close()
+
+    # Plot Power Spectrum
+    N = len(Flux)
+    lenPk = N // 2
+    freq = np.arange(lenPk) / (N * dt)
+
+    from fourier import GP
+    noise = Flux - FGP - model
+    PSD_noise = np.square(np.abs(np.fft.rfft(noise)))
+    bandwidth = GP.automatic_bandwidth(PSD_noise)
+    Pk_noise = GP.getPSD(noise, bandwidth) 
+    Pk_noise = np.ones_like(freq) * np.mean(Pk_noise[250:])
+
+    plt.figure(figsize=(16,8), dpi=550)
+    plt.plot(freq, Pk, label="source + noise")
+    plt.plot(freq, Pk_noise, label="noise")
+    plt.plot(freq,  abs(Pk - Pk_noise), label="source")
+    plt.yscale('log'); plt.xlim([0, 15]); plt.legend()
+    plt.ylim([1e2, 1e7])
+    plt.ylabel(r"$P(\nu)$"); plt.xlabel(r"$\nu$ [1/days]")
+    plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/powerspectrum.png')
+    plt.close()
+
+
+    Pk_raw = np.square(np.abs(np.fft.rfft(Flux - model)))
+    plt.figure(figsize=(16,8), dpi=550)
+    plt.plot(freq, Pk_raw[1:], label="source + noise")
+    plt.yscale('log'); plt.xlim([0, 15]); plt.legend()
+    plt.ylim([1e2, 1e7])
+    plt.ylabel(r"$P(\nu)$"); plt.xlabel(r"$\nu$ [1/days]")
+    plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/raw_powerspectrum.png')
+    plt.close()
+
+    # Plot Noise
+    mask = invVar > 0.5
+    noise = noise[mask]
+
+    from scipy.stats import norm
+    x_axis = np.linspace(-3, 3, 1000)
+    plt.figure(figsize=(16,8), dpi=550)
+    plt.hist(noise, density=True, bins=int(np.sqrt(len(noise))), label="Stellar Noise")
+    plt.plot(x_axis, norm.pdf(x_axis), label="Standard Gaussian")
+    plt.xlabel(r"$n / \sigma$"); plt.ylabel(r"$p(n)$")
+    plt.yscale('log'); plt.legend()
+    plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/noise.png')
+    plt.close()
     
-    
+    ##########################
+
     if len(planet_props) != 0:
         ### find TTVs ###
         planet_props = ttv.pipeline(Time, Flux, invVar, Pk, planet_props)
 
-        [ttv.plots(Time, Flux, invVar, model, FGP, planet_props[k], np.zeros(5000), plotdir + 'init' + str(k), maintitle= 'Known planet') for k in range(len(planet_props))]
+        max_num_periods = (int)(2 * (Time[-1] / hyperparams.period_min))
+        
+        [ttv.plots(Time, Flux, invVar, model, FGP, planet_props[k], np.zeros(max_num_periods), plotdir + 'init' + str(k), maintitle= 'Known planet') for k in range(len(planet_props))]
 
         ### redo the fit ###
         planet_props, Flux, model, Pk, FGP, bandwidth, mask_planets, _ = joint.iteration(Time, Flux, invVar, planet_props, Pk, sharp_freq)
@@ -174,18 +308,21 @@ def mainn(kepid, folder, hyperparams,
             plt.plot(Time, Flux, '.', color= 'black')
             plt.close()
         
+        ### We don't do this - causes memory error
         # save the known planets results
         var_noise = np.average(Pk[int(3 * dt * len(Flux)) + 1:]) / len(Flux) # average power spectrum above the FGP frequency cutoff
-
         planet_props = ttv.fit_quality(Time, Flux - model - FGP, invVar, var_noise, planet_props)
         planet_props = ttv.laplace(Time, Flux, invVar, Pk, planet_props)
         
-        [ttv.plots(Time, Flux, invVar, model, FGP, planet_props[k], np.zeros(5000), plotdir + str(k), maintitle= 'Known planet') for k in range(len(planet_props))]
+        [ttv.plots(Time, Flux, invVar, model, FGP, planet_props[k], np.zeros(max_num_periods), plotdir + str(k), maintitle= 'Known planet') for k in range(len(planet_props))]
         [planet_props[iplanet].save(scratch + folder + '/known_planets/'+str(kepid)+'_' + str(iplanet)) for iplanet in range(len(planet_props))]
 
         # remove planets
         Flux[mask_planets] = FGP[mask_planets]  #alternative used to be: Flux = Flux - model
         invVar[mask_planets] = 0.    
+
+    time_now3 = time.time()
+    print(f"TTVs and Second Fit took {int(time_now3 - time_now2)} seconds.")
 
     ### optionally invert or scramble the data ###
     data_transform = get_data_transform(hyperparams)
@@ -210,10 +347,10 @@ def mainn(kepid, folder, hyperparams,
 
         
     ### nonstationary noise ###
-    local_nonstationarity, step_nonstationarity, rb_nonstationarity= nonstationary.pipeline(Flux, invVar, bandwidth, hyperparams, plotdir)
-    non_stationarity = [np.max(local_nonstationarity), np.argmax(local_nonstationarity) * dt, step_nonstationarity[0], rb_nonstationarity[0]]
-    df = pd.DataFrame([[star.kepid, t_start, star.sigma_star_flux_units, np.max(Pk) / np.min(Pk), *non_stationarity, len(sharp_freq) != 0], ], 
-                      columns = ['kepid', 't_start', 'sigma_star_flux_units', 'PSD_condition_number', 'local_nonstat', 'phase_local_nonstat', 'step_nonstat', 'rb_nonstat', 'has_sharp_peak'])
+    # local_nonstationarity, step_nonstationarity, rb_nonstationarity= nonstationary.pipeline(Flux, invVar, bandwidth, hyperparams, plotdir)
+    # non_stationarity = [np.max(local_nonstationarity), np.argmax(local_nonstationarity) * dt, step_nonstationarity[0], rb_nonstationarity[0]]
+    df = pd.DataFrame([[star.kepid, t_start, star.sigma_star_flux_units, np.max(Pk) / np.min(Pk), len(sharp_freq) != 0], ], 
+                      columns = ['kepid', 't_start', 'sigma_star_flux_units', 'PSD_condition_number', 'has_sharp_peak'])
     df.to_csv(scratch + folder + '/stars/'+str(kepid)+'.csv', sep = '\t', index= False)
 
     ### individual transits and false alarms ###
@@ -241,21 +378,17 @@ def mainn(kepid, folder, hyperparams,
                           [spurious_transits.overlap_with_larger_planets(ttv.mask_planets(Time, planet_props)),]
                           ]    
 
+    time_now4 = time.time()
+    print(f"Spurious Scenarious and False Alarms took {int(time_now4 - time_now3)} seconds.")
+
     ### detection and vetting
 
-    
-    exit()
-    
     def func(nst_seed):
         
         if nst_seed != None:
             period_min_nst = 2.
             rng = np.random.default_rng(nst_seed)
-            if TESS :
-                func_for_delta = nst.transit_duration_limited(rng, max_num_periods, period_min_nst/dt, q_in_dt_units_tess(star.q), 
-                                                                                                    num_transit_durations_min= 2., frac_period_max= 0.4)
-            else : 
-                func_for_delta = nst.transit_duration_limited(rng, max_num_periods, period_min_nst/dt, q_in_dt_units(star.q), 
+            func_for_delta = nst.transit_duration_limited(rng, max_num_periods, period_min_nst/dt, q_in_dt_units(star.q), 
                                                                                                     num_transit_durations_min= 2., frac_period_max= 0.4)
         else:
             func_for_delta = nst.basic(max_num_periods)
@@ -285,47 +418,119 @@ def mainn(kepid, folder, hyperparams,
 
     func(nst_seed)
 
+    time_now5 = time.time()
+    print(f"detection and vetting took  {int(time_now5 - time_now4)} seconds = {(time_now5 - time_now4) / 60.0 :.3} minutes.")
+
 
 if __name__ == '__main__':
     
+    ## Decide over how many bins to average
+    n_bins = 1
+
     from pipeline.hyperparameters import Hyperparams
     
-    ### run a single star ###
-    
-    #kepid = np.array(pd.read_csv(home + 'load/datasets/star_info_withplanets.csv', index_col= False, sep='\t')['kepid'], dtype= int)[0]
-    #kepid = np.array(pd.read_csv(home + 'load/datasets/star_info_gaia.csv', index_col= False, sep='\t')['kepid'], dtype= int)[951]
-    
+    ### run a single star ###    
     hyp = Hyperparams(
         do_nonstat_mf = False, 
         test_recovery= False,
         period_min = 2.,
         #cutoff_fa_eliminate= 4.
-        scan = 1
+        scan = 1,
+
+        # Specify Survey
+        survey="TESS",
+
+        # Also Adjust some Stuff
+        period_density = 1000000,
+        stft_sep = 2*720,
+        stft_width = 720*720
         )
 
+    ### Survey Specific Stuff ###
+    # Get new dt
+    import constants
+    constants.dt = constants.dt_dic[hyp.survey] * n_bins
 
-    #kepids = [5184911, ]#[3852872,8555967,8880317,10253977,5802205,3629119,10844823,9650579,11714107][1:2]
+    # Load Everything with new dt
+    # Usual Imports
+    from constants import *
+    import constants
 
-    # koi_for_nst = pd.read_csv(home + 'load/datasets/test_recovery_steve.csv')
-    # kepids = koi_for_nst['kepid'].drop_duplicates().to_list()[:1]
+    from load.lc import read_lc, add_zeros, quarter_indexes
+    from load.planet import read as read_known_planets
+    from load.star import StarInfo_init
 
-    # kepid = 12403119 #np.array(pd.read_csv(home + '/load/datasets/star_info_gaia.csv', index_col= False, sep='\t')['kepid'], dtype= int)[100]
+    from gaussianization import gaussianize
+    from fourier.MF import stationary
+    from planet import transit, tauprior, nst, inject
+    from false_alarms.pipeline import fa_search
+    from false_alarms import spurious_transits
 
-    #kepid = [7026522, 9896456][0]
-    # kepid = 11773022
+    from pipeline import nonstationary, ttv, joint, scratch_structure
+    from pipeline import vetting
+    from pipeline.inv_scr import get_data_transform
+    from detection.cpu.pipeline import run as detect
+    from detection.cpu.pipeline import prepare as prepare_for_detection
+    from detection.cpu.scan import q_in_dt_units
+    from detection.cpu import template
 
-    tessid = 100100827
+    # New Imports
+    from TESS.load_tess import StarInfo_init_tess, read_lc_tess, add_zeros_tess, read_known_planets_tess, read_alternative
 
-    mainn(tessid, 'individual', hyp, TESS=True)
-
-    #mainn(None, 'individual', hyperparams, None)
-    # num_realizations = 100
-    # kepids = koi_for_nst['kepid'].drop_duplicates().to_list()
-    # job_map= job_map_nst(kepids, num_realizations)
-    # id = 1002
-    # hyperparams.scan = 1
-    # hyperparams.cutoff_eliminate = np.inf
-    # mainn(id, 'individual', hyperparams, job_map= job_map)
+    ### Run Job ###
+    tessids = np.array([310003988, 102264230, 458686847, 368805700, 610976842, 268766053,
+       143143769,  16288184, 152476657, 377873569,  15445551, 239154970,
+       165987272, 201642601,  63211674,  61538902,  69679391, 120757718,
+        27990610, 285272237, 111991770, 346338552,  35022727, 350020859,
+       293612446, 236887394, 299220166, 452808876, 138819293, 149918151,
+       432549364, 159725995, 252479260, 204317710, 293457754,  26017005,
+       448589187,  25375553,  27774415,  70440470, 283722336, 239154970,
+       346626688, 159725995,  14570099,  85593751,  67666096,   9155187,
+       284326455,  15445551,  50712784,  53750200, 164892194,  47911178,
+       272213425, 237320326, 103751498, 380589029,  42821097, 346338552,
+        38087018, 233948455,  31858843, 427332229, 308172249, 349827430,
+        55315929, 310003988, 190998418, 136916387,  63452790,  61538902,
+       271354351,  22529346, 232038798, 166836920, 287563610, 257774438,
+       189625051,  19028197,  13349647, 332022997, 437261733,  26017005,
+        32487566, 270468559, 267572272, 347329162,  44745133, 267572272,
+       420779000,  66818296, 373693175,  54002556,  32949762, 272213425,
+       166836920,  28230919, 162922904,  32487566,  33521996, 101721385,
+       120610833, 191284318, 164458714, 270380593, 264508014, 158170594,
+       347329162, 115524421, 429302040, 122441491, 233948455,  68577662,
+       266593143, 458478250, 281459670, 281541555, 237320326, 273231214,
+        53750200, 137899948, 271354351, 165987272, 204317710, 293612446,
+        97409519,   7020254, 201604954,   8400842,  48506505, 356473034,
+       164458714, 129979528,  69679391, 164892194, 286865921, 358516596,
+       358516596,  13349647, 299158887,  13349647, 281731203,  27990610,
+       157266693,  15445551, 176899385, 138644215,  27916356, 404340025,
+       209752908, 336732616, 159725995, 176868951, 270380593, 120960812,
+       233602827,   4616072, 366631954, 330687113, 243014114, 248075138,
+       369455629, 192826603,  98545929, 368805700,  14614418, 251848941,
+        98283926, 120255950, 248111245,  92226327, 115524421, 458686847,
+       238176110,  27318774, 243200602, 112604564,  50712784, 350020859,
+       204376737, 240681314, 268403451, 158623531, 255930614, 176220787,
+       158388163,  32499655, 272213425, 236445129, 178367144,  36352297,
+       283722336, 189625051,  73717937, 116156517,  13021029,   1129033,
+       399954349, 436875934])    
+    # noises = []
+    # n = 1
+    # for tessid in tessids :
+    #     noise = mainn(tessid, 'individual', hyp)
+    #     noises.append(noise)
+    #     print('\n')
+    #     print(f'{(100.0 * n) / (len(tessids))} % done                  ', end='\n')
+    #     print('\n')
+    #     n += 1
+    # noises = np.concatenate(noises)
+    # np.savetxt('noise.txt', noises)
     
-    
+    start_time = time.time()
+
+    #tessid = 100100827 ## Standard Test
+    tessid = 14570099 ## Peak in Power Spectrum
+    mainn(tessid, 'individual', hyp, start_time=start_time, bins=n_bins)
+
+    end_time = time.time()
+
+    print(f"This took {int((end_time - start_time))} seconds = {(end_time - start_time) / 60.0:.3} minutes.")
     print('Done.')
