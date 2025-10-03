@@ -112,7 +112,7 @@ def read_tess_light_curve(tessid, n_bins = 1, PDCSAP = True, invert=False):
   all_flags = []
 
   search_result = lk.search_lightcurve('TIC ' + str(tessid), mission="TESS", 
-                                       author=["SPOC"], exptime=120)
+                                       author=["SPOC", "TESS-SPOC"], exptime=120)
 
 
   for res in search_result :
@@ -127,16 +127,6 @@ def read_tess_light_curve(tessid, n_bins = 1, PDCSAP = True, invert=False):
         else:
             flux = hdulist[1].data['SAP_FLUX']
 
-    # Remove NaN flux values.
-    valid_indices = np.where(np.isfinite(flux))
-    time = time[valid_indices]
-    flux = flux[valid_indices]
-    flags = flags[valid_indices]
-
-    # # Don't use short Cadence
-    # if time[1] - time[0] < 0.001 :
-    #     continue
-
     if n_bins != 1 : 
         # Average over bins of size n_bins to decrease computational cost
         n = len(time); diff = n % n_bins
@@ -145,6 +135,12 @@ def read_tess_light_curve(tessid, n_bins = 1, PDCSAP = True, invert=False):
         time = time[mask].reshape(-1, n_bins).mean(axis=1)
         flux = flux[mask].reshape(-1, n_bins).mean(axis=1)
         flags = flags[mask].reshape(-1, n_bins).mean(axis=1)
+
+    # Remove NaN flux values.
+    valid_indices = np.where(np.isfinite(flux))
+    time = time[valid_indices]
+    flux = flux[valid_indices]
+    flags = flags[valid_indices]
 
     if invert:
       flux *= -1
@@ -155,7 +151,7 @@ def read_tess_light_curve(tessid, n_bins = 1, PDCSAP = True, invert=False):
       all_flux.append(flux)
       all_flags.append(flags)
 
-    # Use only first batch    
+    # # Use only first batch    
     # break
 
   return all_time, all_flux, all_flags
