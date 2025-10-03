@@ -2,7 +2,7 @@
 import numpy as np
 if not hasattr(np, "int"):
     np.int = int
-import time
+import time as clock
 
 def bit_info(numbers, bit):
     return np.floor_divide(numbers - np.floor_divide(numbers, 2**(bit))* (2**bit), 2**(bit-1))
@@ -17,7 +17,6 @@ def plot_residuals(Time, Flux, FGP, plotdir):
     plt.plot(Time, residuals, '.')
     plt.ylabel("residuals")
     plt.xlabel('time [days]')
-    plt.close()
     
     plt.subplot(3, 1, 2)
     plt.plot(Time, Flux, '.')
@@ -97,13 +96,12 @@ def LOAD_TESS(tessid, folder, hyperparams, batch_num, n_bins) :
     t_start = time[0]
     time -= t_start
     
-    Time, Flux, invVar = add_zeros_tess(time, flux, hyperparams)
+    Time, Flux, invVar = add_zeros_tess(time, flux, hyperparams, zero_paddling=2000 // n_bins)
     max_num_periods = (int)(2 * (Time[-1] / hyperparams.period_min)) # factor of two just to be sure
 
     quarters = quarter_indexes(Time, quarter_beginnings)
 
     planet_props = read_known_planets_tess(star, t_start, hyperparams.test_recovery)
-
 
     # Split Up Into individual Transits for Easier Search Later
     Times, Fluxes, invVars, planet_propes, index_start = [], [], [], [], []
@@ -113,13 +111,13 @@ def LOAD_TESS(tessid, folder, hyperparams, batch_num, n_bins) :
         t_start_i = all_time[i][0]
         all_time[i] -= t_start_i
         
-        Time_i, Flux_i, invVar_i = add_zeros_tess(all_time[i], all_flux[i], hyperparams)
+        Time_i, Flux_i, invVar_i = add_zeros_tess(all_time[i], all_flux[i], hyperparams, zero_paddling=2000 // n_bins)
         planet_props_i = read_known_planets_tess(star, t_start_i, hyperparams.test_recovery)
 
         Times.append(Time_i); Fluxes.append(Flux_i); invVars.append(invVar_i)
         planet_propes.append(planet_props_i)
 
-        index_start.append( np.where( abs(Time + t_start - t_start_i) < 0.001 )[0][0] )
+        index_start.append( np.where( abs(Time + t_start - t_start_i) < 0.001 * n_bins )[0][0] )
     seperate_transists = [Times, Fluxes, invVars, planet_propes, index_start]
         
     # Spline
@@ -158,7 +156,7 @@ def mainn(kepid, folder, hyperparams,
 
     print(f"Size of Input Flux Array is {len(Flux)}")
 
-    time_now = time.time()
+    time_now = clock.time()
     print(f"Reading data and preprocessing took {int(time_now - start_time)} seconds.")
 
     ### jointly fit FGP, planets and gaussianize outliers ###
@@ -210,6 +208,7 @@ def mainn(kepid, folder, hyperparams,
         has_peaks = (len(peaks) != 0)
         if has_peaks:
             sharp_freq = peaks/Time[-1]
+            print("Power Spectrum has sharp peaks.")
         else:
             sharp_freq = np.array([])
 
@@ -219,18 +218,19 @@ def mainn(kepid, folder, hyperparams,
     else :
         planet_props, Flux, model, Pk, FGP, bandwidth, mask_planets, sharp_freq = joint.iteration(Time, Flux, invVar, planet_props, sharp_freq= None)
 
-    time_now2 = time.time()
+    time_now2 = clock.time()
     print(f"Initial Fit took {int(time_now2 - time_now)} seconds.")
 
     ### Some Plots ###
     # Gaussian Process
-    mask = Time < 5
+    planet_period, _, _ = planet_props[0].params
 
     plt.figure(figsize=(16,8), dpi=550)
-    plt.plot(Time[mask], Flux[mask], label="Observed Flux", alpha=0.33)
-    plt.plot(Time[mask], FGP[mask], label="GP of Stellar Variability", color="red")
-    plt.plot(Time[mask], model[mask], label="Fit of Planet Transit", alpha=0.5)
-    plt.xlabel("t [days]"); plt.legend()
+    plt.plot(Time, Flux, label="Observed Flux", alpha=0.33)
+    plt.plot(Time, FGP, label="GP of Stellar Variability", color="red")
+    plt.plot(Time, model, label="Fit of Planet Transit", alpha=0.5)
+    plt.xlabel("t [days]"); plt.legend(); 
+    plt.xlim([0.0, 5 * planet_period]); plt.ylim([Flux.min() * 1.05, 3])
     plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/flux_plot_zoom.png')
     plt.close()
 
@@ -301,6 +301,13 @@ def mainn(kepid, folder, hyperparams,
         ### redo the fit ###
         planet_props, Flux, model, Pk, FGP, bandwidth, mask_planets, _ = joint.iteration(Time, Flux, invVar, planet_props, Pk, sharp_freq)
 
+        plt.figure(figsize=(16,8), dpi=550)
+        plt.plot(Time, Flux, label="Observed Flux")
+        plt.plot(Time, FGP, label="GP of Stellar Variability")
+        plt.plot(Time, model, label="Fit of Planet Transit")
+        plt.xlabel("t [days]"); plt.legend()
+        plt.savefig(scratch + folder + '/plots/' + str(kepid) + '/second_flux_plot.png')
+        plt.close()
 
         if hyperparams.show:
             plt.plot(Time, model+FGP, color= 'tab:blue')
@@ -308,7 +315,6 @@ def mainn(kepid, folder, hyperparams,
             plt.plot(Time, Flux, '.', color= 'black')
             plt.close()
         
-        ### We don't do this - causes memory error
         # save the known planets results
         var_noise = np.average(Pk[int(3 * dt * len(Flux)) + 1:]) / len(Flux) # average power spectrum above the FGP frequency cutoff
         planet_props = ttv.fit_quality(Time, Flux - model - FGP, invVar, var_noise, planet_props)
@@ -318,10 +324,10 @@ def mainn(kepid, folder, hyperparams,
         [planet_props[iplanet].save(scratch + folder + '/known_planets/'+str(kepid)+'_' + str(iplanet)) for iplanet in range(len(planet_props))]
 
         # remove planets
-        Flux[mask_planets] = FGP[mask_planets]  #alternative used to be: Flux = Flux - model
+        Flux[mask_planets] = FGP[mask_planets]
         invVar[mask_planets] = 0.    
 
-    time_now3 = time.time()
+    time_now3 = clock.time()
     print(f"TTVs and Second Fit took {int(time_now3 - time_now2)} seconds.")
 
     ### optionally invert or scramble the data ###
@@ -355,12 +361,12 @@ def mainn(kepid, folder, hyperparams,
 
     ### individual transits and false alarms ###
 
+    ### NOTE: I removed the plot command
     Flux, invVar, fp_info, fp_scores = fa_search(Time, Flux, invVar, Pk, FGP, spline, star, hyperparams, plotdir)
 
     if len(fp_info) > 0:
         planet_props, Flux, model, Pk, FGP, bandwidth, _, _ = joint.iteration(Time, Flux, invVar, [], Pk, sharp_freq)
     
-
     if hyperparams.show:
         plot_residuals(Time, Flux, FGP, plotdir)   
     
@@ -378,7 +384,7 @@ def mainn(kepid, folder, hyperparams,
                           [spurious_transits.overlap_with_larger_planets(ttv.mask_planets(Time, planet_props)),]
                           ]    
 
-    time_now4 = time.time()
+    time_now4 = clock.time()
     print(f"Spurious Scenarious and False Alarms took {int(time_now4 - time_now3)} seconds.")
 
     ### detection and vetting
@@ -392,7 +398,8 @@ def mainn(kepid, folder, hyperparams,
                                                                                                     num_transit_durations_min= 2., frac_period_max= 0.4)
         else:
             func_for_delta = nst.basic(max_num_periods)
-            
+        time_nst = clock.time()
+        print(f"nst took {int(time_now4 - time_nst)} seconds.")    
             
         if hyperparams.do_nonstat_mf:
             bandwidth_short = nonstationary.bandwidth_long_to_short(bandwidth, len(Time), hyperparams.stft_width)
@@ -404,6 +411,9 @@ def mainn(kepid, folder, hyperparams,
             psd = Pk
             mf_update = stationary
             do_conv = lambda Flux, Pk: template.convs(Flux, template_bank.templates, Pk)
+
+        time_nonstat_mf = clock.time()
+        print(f"non-stationary noise took {int(time_nst - time_nonstat_mf)} seconds.")
         
         # scan for periodic events
         template_bank, period_prior_normalization = prepare_for_detection(invVar, psd, star, spline_prior, hyperparams, func_for_delta_given= func_for_delta, do_nonstat_mf= hyperparams.do_nonstat_mf)
@@ -412,20 +422,26 @@ def mainn(kepid, folder, hyperparams,
         
         candidates_all = detect(Flux, invVar, psd, template_bank, hyperparams, kepid, hyperparams.do_nonstat_mf)
         
+        time_detection = clock.time()
+        print(f"detection took {int(time_detection - time_nonstat_mf)} seconds.")
+
         # vet the detections
         spurious = spurious_transits.SpuriousTransits(spurious_scenarios, func_for_delta, len(Time))
         vetting.main(Time, Flux, invVar, FGP, psd, template_bank, period_prior_normalization, candidates_all, star, spline, spline_prior, spurious, batch_num, func_for_delta, hyperparams, folder, mf_update, do_conv, plotdir)
+        
+        time_vetting = clock.time()
+        print(f"vetting took {int(time_vetting - time_detection)} seconds.")
 
     func(nst_seed)
 
-    time_now5 = time.time()
+    time_now5 = clock.time()
     print(f"detection and vetting took  {int(time_now5 - time_now4)} seconds = {(time_now5 - time_now4) / 60.0 :.3} minutes.")
 
 
 if __name__ == '__main__':
     
     ## Decide over how many bins to average
-    n_bins = 1
+    n_bins = 10
 
     from pipeline.hyperparameters import Hyperparams
     
@@ -441,9 +457,9 @@ if __name__ == '__main__':
         survey="TESS",
 
         # Also Adjust some Stuff
-        period_density = 1000000,
-        stft_sep = 2*720,
-        stft_width = 720*720
+        period_density = 1000000 // n_bins,
+        stft_sep = 2*(720 // n_bins),
+        stft_width = (720 // n_bins)*(720 // n_bins)
         )
 
     ### Survey Specific Stuff ###
@@ -475,7 +491,7 @@ if __name__ == '__main__':
     from detection.cpu import template
 
     # New Imports
-    from TESS.load_tess import StarInfo_init_tess, read_lc_tess, add_zeros_tess, read_known_planets_tess, read_alternative
+    from TESS.load_tess import StarInfo_init_tess, add_zeros_tess, read_known_planets_tess, read_alternative
 
     ### Run Job ###
     tessids = np.array([310003988, 102264230, 458686847, 368805700, 610976842, 268766053,
@@ -524,13 +540,14 @@ if __name__ == '__main__':
     # noises = np.concatenate(noises)
     # np.savetxt('noise.txt', noises)
     
-    start_time = time.time()
+    start_time = clock.time()
 
-    #tessid = 100100827 ## Standard Test
-    tessid = 14570099 ## Peak in Power Spectrum
+    # tessid = 100100827 ## Standard Test
+    # tessid = 36352297 
+    tessid = int( input("TESS id? ") )
     mainn(tessid, 'individual', hyp, start_time=start_time, bins=n_bins)
 
-    end_time = time.time()
+    end_time = clock.time()
 
     print(f"This took {int((end_time - start_time))} seconds = {(end_time - start_time) / 60.0:.3} minutes.")
     print('Done.')
